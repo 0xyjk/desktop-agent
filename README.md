@@ -1,60 +1,163 @@
 # Desktop Agent
 
-使用 Electron 构建的桌面端 AI Agent 应用。以 8 篇教程系列的形式从零开发，每篇对应一个功能完整的 commit，逐步从基础聊天机器人演进为全功能桌面 Agent。
+一个完整但保持 minimal 的桌面端 general agent 模板。项目不是只做聊天 UI，而是把一个通用 Agent 所需的核心能力都串成了可运行的最小闭环：
 
-## 技术栈
+| # | 能力 | 作用 |
+|---|------|------|
+| 1 | 基础 Chatbot | 与 LLM 文本对话 |
+| 2 | Tool Calling | LLM 执行函数 |
+| 3 | MCP | 接入外部服务 |
+| 4 | Skill 系统 | 可插拔能力 |
+| 5 | 代码执行 | 沙箱中运行代码 |
+| 6 | 记忆系统 | 持久化上下文 |
 
-| 层级 | 技术 |
-|------|------|
-| 桌面框架 | Electron（通过 electron-vite 构建） |
-| 前端 | React + TypeScript + Tailwind CSS + shadcn/ui + ai-elements |
-| 内嵌 API 服务器 | Hono |
-| AI 集成 | Vercel AI SDK（`ai` + `@ai-sdk/react`） |
-| LLM 接入 | OpenAI 兼容 API（DeepSeek、Ollama 等） |
-| 包管理器 | pnpm |
+核心目标：用 Electron + React 做桌面壳，用本地 Hono server 承载 Agent runtime，用 Vercel AI SDK 的 `ToolLoopAgent` 统一 LLM、工具、MCP、Skills、代码执行和长期记忆。
 
-## 架构
+## 实际架构
 
 ```
-┌─────────────────────────────────────┐
-│            Electron App             │
-│                                     │
-│  ┌─────────────┐  ┌──────────────┐  │
-│  │  主进程      │  │  渲染进程     │  │
-│  │              │  │  (React)     │  │
-│  │  Hono Server │◄─┤              │  │
-│  │  /api/chat   │  │  useChat()   │  │
-│  │              │──►  ai-elements │  │
-│  │  AI SDK      │  │  shadcn/ui   │  │
-│  │  streamText  │  │              │  │
-│  └─────────────┘  └──────────────┘  │
-│         │                           │
-└─────────┼───────────────────────────┘
-          │ HTTPS
-          ▼
-   ┌──────────────┐
-   │ LLM Provider │
-   │ (OpenAI API) │
-   └──────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                           Electron Desktop                           │
+│                                                                     │
+│  ┌────────────────────────────┐        ┌──────────────────────────┐ │
+│  │ Main Process               │        │ Renderer Process          │ │
+│  │                            │        │ React + ai-elements       │ │
+│  │  ┌──────────────────────┐  │ HTTP   │                          │ │
+│  │  │ Hono API Server       │◄────────►│ useChat + ChatWindow      │ │
+│  │  │ localhost:3315        │  │        │ MCP / Memory / Skill UI   │ │
+│  │  └──────────┬───────────┘  │        └──────────────────────────┘ │
+│  │             │              │                                      │
+│  │  ┌──────────▼───────────┐  │                                      │
+│  │  │ ToolLoopAgent         │  │                                      │
+│  │  │ AI SDK runtime        │  │                                      │
+│  │  └──────────┬───────────┘  │                                      │
+│  │             │              │                                      │
+│  │  ┌──────────▼────────────────────────────────────────────────┐    │
+│  │  │ Tool Set                                                   │    │
+│  │  │ - shell: 执行本机命令                                       │    │
+│  │  │ - execute_python: 持久 IPython kernel                       │    │
+│  │  │ - use_skill: 按需加载 ~/.agents/skills/*/SKILL.md           │    │
+│  │  │ - MCP tools: 动态聚合外部 MCP server 暴露的工具             │    │
+│  │  └──────────┬────────────────────────────────────────────────┘    │
+│  │             │              │                                      │
+│  │  ┌──────────▼───────────┐  │                                      │
+│  │  │ Persistent Context    │  │                                      │
+│  │  │ ~/.agents/memory.md   │  │                                      │
+│  │  │ userData/mcp.json     │  │                                      │
+│  │  └──────────────────────┘  │                                      │
+│  └────────────────────────────┘                                      │
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │ OpenAI-compatible HTTP API
+                          ▼
+                 ┌────────────────────┐
+                 │ LLM Provider        │
+                 │ OpenAI / DeepSeek   │
+                 │ Ollama / compatible │
+                 └────────────────────┘
 ```
 
-- 主进程启动 Hono HTTP 服务器，监听本地端口，处理 AI SDK 调用
-- 渲染进程通过 `useChat` + `DefaultChatTransport` 与主进程 HTTP 通信
-- ai-elements 组件渲染聊天 UI
+### 运行链路
+
+1. Electron 主进程启动本地 Hono API server，默认监听 `http://localhost:3315`。
+2. Renderer 里的 `ChatWindow` 使用 `useChat` 和 `DefaultChatTransport` 调用 `/api/chat`。
+3. `/api/chat` 把前端消息交给 `ToolLoopAgent`，由 Agent 自主决定是否调用工具。
+4. `ToolLoopAgent` 的 system instructions 由三部分组成：基础助手指令、`~/.agents/memory.md`、当前可用 Skills 列表。
+5. Agent 可调用内置工具、动态 MCP 工具，或通过 `/skill-name` / `use_skill` 加载 skill 指令。
+6. 工具执行结果以 AI SDK UI message parts 返回，前端按工具类型渲染终端输出、Python 图表或通用 tool panel。
+
+## 能力拆解
+
+### 1. 基础 Chatbot
+
+- 前端：`src/renderer/src/components/ChatWindow.tsx`
+- 后端：`src/main/server.ts`
+- 使用 AI SDK 的流式 UI message 协议，支持边生成边渲染。
+
+### 2. Tool Calling
+
+- Agent runtime：`ToolLoopAgent`
+- 内置工具：
+  - `shell`：执行本机 shell 命令，带超时和输出截断
+  - `execute_python`：执行 Python 代码并返回文本和图片
+  - `use_skill`：加载指定 Skill 的完整说明
+- 工具统一注册在 `src/main/server.ts` 的 `rebuildAgent()` 中。
+
+### 3. MCP
+
+- 实现位置：`src/main/mcp.ts`
+- 前端入口：`src/renderer/src/components/MCPSettings.tsx`
+- 支持通过 UI 添加、删除、重连 HTTP MCP server。
+- MCP 配置持久化在 Electron `userData` 目录下的 `mcp.json`。
+- 每次 MCP 配置变化后会重新构建 Agent，把最新 MCP tools 合并进工具集。
+
+### 4. Skill 系统
+
+- 实现位置：`src/main/skills.ts`
+- 前端入口：`src/renderer/src/components/SkillPicker.tsx`
+- Skill 存放在 `~/.agents/skills/<skill-name>/SKILL.md`。
+- 启动时扫描 Skill metadata，并把可用 Skill 列表注入 system prompt。
+- 用户可以输入 `/skill-name` 直接把 Skill 内容注入当前请求，也可以让 Agent 调用 `use_skill` 按需加载。
+
+### 5. 代码执行
+
+- Shell 工具：`src/main/tools/shell.ts`
+- Python kernel：`src/main/tools/python_kernel.ts`
+- Python 服务脚本：`resources/kernel_server.py`
+- Python 代码运行在独立的持久 IPython kernel 中，变量、import 和上下文会在同一会话内保留。
+- Python 执行结果支持 stdout、stderr、异常 traceback，以及 matplotlib 生成的 PNG 图片。
+
+### 6. 记忆系统
+
+- 实现位置：`src/main/server.ts` 和 `src/renderer/src/components/MemoryEditor.tsx`
+- 记忆文件：`~/.agents/memory.md`
+- 用户在 UI 中编辑 Markdown，全局记忆会被注入 Agent system instructions。
+- 保存记忆后会立即 `rebuildAgent()`，后续对话使用最新上下文。
 
 ## 项目结构
 
 ```
 src/
-├── main/           # Electron 主进程 + Hono 服务器
-├── preload/        # Electron 预加载脚本
-└── renderer/       # React 前端（渲染进程）
+├── main/
+│   ├── index.ts              # Electron 主进程入口，启动窗口和本地 API server
+│   ├── server.ts             # Hono API + ToolLoopAgent 组装
+│   ├── mcp.ts                # MCP server 配置、连接和工具聚合
+│   ├── skills.ts             # Skill 扫描、提示注入和 use_skill 工具
+│   └── tools/
+│       ├── shell.ts          # shell tool
+│       └── python_kernel.ts  # Python execution tool
+├── preload/
+│   └── index.ts              # Electron preload
+└── renderer/
     └── src/
-        ├── components/
-        │   └── ai-elements/   # ai-elements UI 组件
         ├── App.tsx
+        ├── components/
+        │   ├── ChatWindow.tsx
+        │   ├── MCPSettings.tsx
+        │   ├── MemoryEditor.tsx
+        │   ├── SkillPicker.tsx
+        │   ├── PythonResult.tsx
+        │   ├── ai-elements/
+        │   └── ui/
         └── main.tsx
+
+resources/
+└── kernel_server.py          # 持久 IPython kernel JSON 协议服务
+
+docs/chapters/                # 6 个能力模块的逐章实现说明
 ```
+
+## 技术栈
+
+| 层级 | 技术 |
+|------|------|
+| 桌面框架 | Electron + electron-vite |
+| 前端 | React + TypeScript + Tailwind CSS + shadcn/ui + ai-elements |
+| Agent runtime | Vercel AI SDK `ToolLoopAgent` |
+| API server | Hono + `@hono/node-server` |
+| LLM 接入 | OpenAI-compatible provider |
+| 外部工具 | `@ai-sdk/mcp` |
+| 代码执行 | Shell + persistent IPython kernel |
+| 包管理器 | pnpm |
 
 ## 快速开始
 
@@ -63,9 +166,15 @@ pnpm install
 pnpm dev
 ```
 
-## 配置
+如果要使用 Python 代码执行能力，需要本机可运行 `python3`，并安装 Jupyter kernel 相关依赖：
 
-在项目根目录创建 `.env` 文件：
+```bash
+python3 -m pip install jupyter_client ipykernel matplotlib
+```
+
+## 配置 LLM
+
+在项目根目录创建 `.env`：
 
 ```env
 LLM_API_KEY=your-api-key-here
@@ -73,9 +182,32 @@ LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
 ```
 
-支持任何 OpenAI 兼容的 provider（DeepSeek、Ollama 等）。
+`LLM_BASE_URL` 支持任何 OpenAI-compatible provider，例如 OpenAI、DeepSeek、本地 Ollama 兼容接口等。
 
-## 教程系列
+## 本地数据
+
+| 数据 | 位置 | 说明 |
+|------|------|------|
+| 全局记忆 | `~/.agents/memory.md` | 每次构建 Agent 时注入 system instructions |
+| Skills | `~/.agents/skills/<name>/SKILL.md` | 启动时扫描，可通过 `/skill-name` 调用 |
+| MCP 配置 | Electron `userData/mcp.json` | 保存 MCP server URL 和 headers |
+
+## API
+
+| Method | Path | 说明 |
+|--------|------|------|
+| `POST` | `/api/chat` | Agent 对话入口 |
+| `GET` | `/api/skills` | 获取已安装 Skills |
+| `GET` | `/api/memory` | 读取全局记忆 |
+| `PUT` | `/api/memory` | 保存全局记忆并重建 Agent |
+| `GET` | `/api/mcp/servers` | 查看 MCP server 状态 |
+| `POST` | `/api/mcp/servers` | 添加 MCP server |
+| `DELETE` | `/api/mcp/servers/:name` | 删除 MCP server |
+| `POST` | `/api/mcp/servers/:name/reconnect` | 重连 MCP server |
+
+## 教程章节
+
+这个仓库也可以作为从零搭建 Agent 的教程代码。每章对应一个能力模块：
 
 | 篇 | 标题 | 核心功能 |
 |----|------|---------|
@@ -86,53 +218,23 @@ LLM_MODEL=gpt-4o-mini
 | 5 | 代码执行 | 沙箱中运行代码 |
 | 6 | 记忆系统 | 持久化上下文 |
 
-每篇的实现指南在 [`docs/chapters/`](docs/chapters/) 目录下。
+实现指南位于 [`docs/chapters/`](docs/chapters/)。
 
----
-
-## AI 编码助手指令
-
-> 以下内容为 AI 编码助手（Claude Code、Cursor、Copilot、Trae 等）提供编码规范。
-
-### 开发命令
+## 开发命令
 
 ```bash
 pnpm install          # 安装依赖
-pnpm dev              # 启动开发服务器（electron-vite）
+pnpm dev              # 启动开发环境
+pnpm typecheck        # TypeScript 检查
+pnpm lint             # ESLint 检查
 pnpm build            # 生产构建
-pnpm lint             # 运行代码检查
 ```
 
-### 编码规范
+## 开发约定
 
-- 语言: TypeScript（严格模式）
-- 代码注释使用中文，commit message 使用英文
-- UI 界面文本使用中文
-- 使用 ES modules（`import`/`export`），不使用 CommonJS
-- 使用 AI SDK 相关 API 前，先查阅 `node_modules/ai/docs/` 获取最新用法，不要依赖记忆
-- 禁止硬编码 API Key，统一使用环境变量或用户设置
-- 聊天场景优先使用 `streamText` 而非 `generateText`
-
-### 文件命名规范
-
-- React 组件: PascalCase（如 `ChatWindow.tsx`）
-- 工具函数: camelCase（如 `formatMessage.ts`）
-- AI SDK 工具定义: 放在 `src/main/tools/` 目录，每个工具一个文件
-
-### Git 工作流
-
-- 每篇教程对应一个聚焦的 commit
-- Commit message 格式: `ch<N>: <description>`（如 `ch1: basic chatbot with streaming`）
-- 保持 commit 原子性——每个 commit 只包含一个功能，对应一篇教程
-
-### 重要提示
-
-- ai-elements 组件位于 `src/renderer/src/components/ai-elements/`（通过 `npx ai-elements@latest` 安装）
-- **UI 优先使用 ai-elements 自带的组件**，不要自己从零写。常用组件包括：
-  - `Conversation` / `ConversationContent` / `ConversationScrollButton` — 对话容器和自动滚动
-  - `Message` / `MessageContent` / `MessageResponse` — 消息渲染（内置 markdown + 流式效果）
-  - `PromptInput` / `PromptInputTextarea` / `PromptInputSubmit` — 输入框（支持快捷键提交、状态图标）
-  - `Reasoning` / `Sources` / `Suggestion` 等 — 按需使用
-  - 官方示例参考：https://elements.ai-sdk.dev/examples/chatbot
-- Hono 路由放在 `src/main/` 目录下，保持服务器配置简洁
-- 每篇教程的实现指南在 `docs/chapters/` 目录下
+- 语言使用 TypeScript，保持 strict 类型约束。
+- UI 文案使用中文。
+- 不硬编码 API Key，统一通过 `.env` 或用户配置读取。
+- 聊天和 Agent 流式输出优先使用 AI SDK 的 stream / UI message 机制。
+- 新增工具放在 `src/main/tools/`，再在 `rebuildAgent()` 中注册。
+- 新增前端 Agent 输出形态时，优先复用 `ai-elements` 组件。
