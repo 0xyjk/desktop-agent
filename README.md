@@ -1,4 +1,4 @@
-# Desktop Agent
+# desktop-agent
 
 一个完整但保持 minimal 的桌面端 general agent 模板。项目不是只做聊天 UI，而是把一个通用 Agent 所需的核心能力都串成了可运行的最小闭环：
 
